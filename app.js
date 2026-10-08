@@ -1,0 +1,1442 @@
+'use strict';
+
+/* ======================= 常量 ======================= */
+const LS_KEY = 'shunshouji.data.v1';
+const UI_KEY = 'shunshouji.ui.v1'; // 记住上次的分类/账户/类型，实现连记
+
+const CATEGORIES = {
+  income: ['工资', '奖金', '兼职', '理财收益', '红包', '其他收入'],
+  expense: ['餐饮', '交通', '购物', '居住', '娱乐', '医疗', '教育', '通讯', '人情', '其他支出'],
+};
+
+const CATEGORY_ICON = {
+  '工资': '💰', '奖金': '🎁', '兼职': '🧑‍💻', '理财收益': '📈', '红包': '🧧', '其他收入': '➕',
+  '餐饮': '🍜', '交通': '🚌', '购物': '🛍️', '居住': '🏠', '娱乐': '🎮', '医疗': '💊',
+  '教育': '📚', '通讯': '📱', '人情': '🎁', '其他支出': '📦',
+};
+
+const DEFAULT_ACCOUNTS = [
+  { id: 'cash', name: '现金', icon: '💰', initialBalance: 0 },
+  { id: 'bank', name: '银行卡', icon: '🏦', initialBalance: 0 },
+  { id: 'wechat', name: '微信', icon: '💬', initialBalance: 0 },
+  { id: 'alipay', name: '支付宝', icon: '🛒', initialBalance: 0 },
+];
+
+const PALETTE = ['#22c55e', '#3b82f6', '#f59e0b', '#8b5cf6', '#ef4444', '#06b6d4',
+  '#f472b6', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#a855f7'];
+
+const ALL_CAT_NAMES = [...CATEGORIES.income, ...CATEGORIES.expense];
+
+/* ======================= 状态 ======================= */
+function defaultState() {
+  return {
+    transactions: [],
+    accounts: DEFAULT_ACCOUNTS.map(a => ({ ...a })),
+    budget: { monthly: 0 },
+    notes: [],
+    loans: [],
+    theme: 'auto',
+  };
+}
+
+function normalizeAccounts(arr) {
+  return arr.map(a => ({
+    id: a.id,
+    name: String(a.name || '账户'),
+    icon: a.icon || '💰',
+    initialBalance: Number(a.initialBalance) || 0,
+  }));
+}
+
+function load() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return defaultState();
+    const p = JSON.parse(raw);
+    const d = defaultState();
+    const accounts = Array.isArray(p.accounts) && p.accounts.length ? normalizeAccounts(p.accounts) : d.accounts;
+    return {
+      transactions: Array.isArray(p.transactions) ? p.transactions : [],
+      accounts,
+      budget: { monthly: Number(p.budget && p.budget.monthly) || 0 },
+      notes: Array.isArray(p.notes) ? p.notes : [],
+      loans: Array.isArray(p.loans) ? p.loans : [],
+      theme: ['auto', 'light', 'dark'].includes(p.theme) ? p.theme : 'auto',
+    };
+  } catch (e) {
+    return defaultState();
+  }
+}
+
+let state = load();
+
+function save() {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) { toast('保存失败：存储空间不足'); }
+}
+
+/* ======================= 表单即时状态 ======================= */
+const _sticky = loadUi();
+let tx = { type: _sticky.type, category: _sticky.category };
+let editingId = null;
+let editingNoteId = null;
+let editingLoanId = null;
+let loanType = 'lend';
+let formAccountId = (_sticky.accountId && state.accounts.some(a => a.id === _sticky.accountId))
+  ? _sticky.accountId
+  : (state.accounts.length ? state.accounts[0].id : '');
+
+const filters = { type: '', month: '', category: '', account: '' };
+let statsSub = 'overview';
+let statsMonthValue = thisMonthStr();
+let dayMonthValue = thisMonthStr();
+let yearValue = String(new Date().getFullYear());
+
+/* ======================= 工具函数 ======================= */
+function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+function thisMonthStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
+}
+
+function monthLabel(ym) {
+  const [y, m] = String(ym).split('-');
+  return `${y}年${Number(m)}月`;
+}
+
+function daysInMonth(y, m) { return new Date(y, m, 0).getDate(); }
+
+function dateLabel(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return String(dateStr || '');
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = Math.round((today - d) / 86400000);
+  if (diff === 0) return '今天';
+  if (diff === 1) return '昨天';
+  const week = ['日', '一', '二', '三', '四', '五', '六'][d.getDay()];
+  const sameYear = d.getFullYear() === today.getFullYear();
+  return sameYear ? `${d.getMonth() + 1}月${d.getDate()}日 周${week}` : `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日`;
+}
+
+function fmtAmount(n) {
+  const v = Math.abs(n || 0);
+  const s = v.toFixed(2);
+  const [int, dec] = s.split('.');
+  return int.replace(/\B(?=(\d{3})+(?!\d))/g, ',') + '.' + dec;
+}
+
+function fmtSignedMoney(n) {
+  return (n < 0 ? '−' : '') + '¥' + fmtAmount(n);
+}
+
+function niceCeil(v) {
+  if (!isFinite(v) || v <= 0) return 10;
+  const pow = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / pow;
+  const m = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+  return m * pow;
+}
+
+function fmtShort(n) {
+  const v = Math.abs(n);
+  if (v >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + '万';
+  if (v >= 1000) { const k = n / 1000; return (Number.isInteger(k) ? k : k.toFixed(1)) + 'k'; }
+  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+}
+
+function weekdayCN(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return '';
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()];
+}
+
+function byDateDesc(a, b) {
+  if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+  return (b.createdAt || 0) - (a.createdAt || 0);
+}
+
+function collectMonths() {
+  const set = new Set();
+  for (const t of state.transactions) if (t.date) set.add(t.date.slice(0, 7));
+  return [...set].sort((a, b) => (a < b ? 1 : -1));
+}
+
+function collectYears() {
+  const set = new Set();
+  for (const t of state.transactions) if (t.date) set.add(t.date.slice(0, 4));
+  set.add(String(new Date().getFullYear()));
+  return [...set].sort((a, b) => (a < b ? 1 : -1));
+}
+
+function totalsForMonth(ym) {
+  let income = 0, expense = 0;
+  for (const t of state.transactions) {
+    if (t.date && t.date.slice(0, 7) === ym) {
+      if (t.type === 'income') income += t.amount; else expense += t.amount;
+    }
+  }
+  return { income, expense };
+}
+
+function totalIncome() { let s = 0; for (const t of state.transactions) if (t.type === 'income') s += t.amount; return s; }
+function totalExpense() { let s = 0; for (const t of state.transactions) if (t.type === 'expense') s += t.amount; return s; }
+
+function accountTotals(aid) {
+  let income = 0, expense = 0;
+  for (const t of state.transactions) {
+    if (t.accountId === aid) { if (t.type === 'income') income += t.amount; else expense += t.amount; }
+  }
+  const a = state.accounts.find(x => x.id === aid);
+  const initial = a ? (a.initialBalance || 0) : 0;
+  return { income, expense, net: income - expense, current: initial + income - expense };
+}
+
+function totalAssets() {
+  let s = 0;
+  for (const a of state.accounts) s += accountTotals(a.id).current;
+  return s;
+}
+
+/* ======================= DOM 引用 ======================= */
+const $ = id => document.getElementById(id);
+const monthSummary = $('monthSummary'), budgetBanner = $('budgetBanner');
+const typeSeg = $('typeSeg'), categoryChipsEl = $('categoryChips'), freqCatsEl = $('freqCats');
+const accountSelect = $('accountSelect'), dateInput = $('dateInput');
+const amountText = $('amountText'), noteInput = $('noteInput');
+const saveBtn = $('saveBtn'), cancelEditBtn = $('cancelEditBtn'), lastSavedEl = $('lastSaved');
+const keypadEl = $('keypad');
+const searchInput = $('searchInput'), listSummary = $('listSummary'), txList = $('txList');
+const filterMonth = $('filterMonth'), filterCategory = $('filterCategory'), filterAccount = $('filterAccount');
+const statsMonth = $('statsMonth'), statsSummary = $('statsSummary');
+const donut = $('donut'), incomeDonut = $('incomeDonut');
+const dayMonth = $('dayMonth'), daySummary = $('daySummary'), dayChart = $('dayChart'), dayList = $('dayList');
+const yearSelect = $('yearSelect'), yearSummary = $('yearSummary'), yearBar = $('yearBar'), yearCompare = $('yearCompare');
+const accountDonut = $('accountDonut'), incomeAccountDonut = $('incomeAccountDonut'), accountBreakdown = $('accountBreakdown');
+const ovAssets = $('ovAssets'), ovSummary = $('ovSummary'), analysisList = $('analysisList');
+const accountList = $('accountList'), budgetInput = $('budgetInput'), themeSeg = $('themeSeg');
+const memoInput = $('memoInput'), addNoteBtn = $('addNoteBtn'), cancelNoteEditBtn = $('cancelNoteEditBtn');
+const notesList = $('notesList'), notesSummary = $('notesSummary');
+const loanTypeSeg = $('loanTypeSeg'), loanAmount = $('loanAmount'), loanPerson = $('loanPerson'), loanDate = $('loanDate'), loanNote = $('loanNote');
+const loanSaveBtn = $('loanSaveBtn'), loanCancelEditBtn = $('loanCancelEditBtn');
+const loanSummary = $('loanSummary'), loanList = $('loanList');
+
+/* ======================= Toast ======================= */
+let toastTimer = null;
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+}
+
+/* ======================= 主题 ======================= */
+function resolveTheme() {
+  if (state.theme === 'light') return 'light';
+  if (state.theme === 'dark') return 'dark';
+  return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+function applyTheme() {
+  const resolved = resolveTheme();
+  document.documentElement.dataset.theme = resolved;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = resolved === 'dark' ? '#0f1115' : '#16a34a';
+  const toggle = $('themeToggle');
+  if (toggle) toggle.textContent = resolved === 'dark' ? '🌙' : '☀️';
+}
+
+/* ======================= 通用卡片 / 图表 ======================= */
+function summaryGridHTML(income, expense, labels) {
+  const l = labels || {};
+  const bal = income - expense;
+  return `
+    <div class="sum-card sum-income"><div class="sum-label">${l.in || '收入'}</div><div class="sum-value">¥${fmtAmount(income)}</div></div>
+    <div class="sum-card sum-expense"><div class="sum-label">${l.ox || '支出'}</div><div class="sum-value">¥${fmtAmount(expense)}</div></div>
+    <div class="sum-card sum-balance"><div class="sum-label">${l.bal || '结余'}</div><div class="sum-value ${bal < 0 ? 'neg' : ''}">${fmtSignedMoney(bal)}</div></div>`;
+}
+
+function assetCardHTML() {
+  const totalIn = totalIncome(), totalOut = totalExpense();
+  const net = totalIn - totalOut;
+  const initSum = state.accounts.reduce((s, a) => s + (a.initialBalance || 0), 0);
+  const assets = totalAssets();
+  const neg = assets < 0;
+  return `<div class="asset-card ${neg ? 'neg' : ''}">
+    <div class="asset-label">净资产</div>
+    <div class="asset-value">${neg ? '−' : ''}¥${fmtAmount(assets)}</div>
+    <div class="asset-sub">初始存款 ¥${fmtAmount(initSum)} ＋ 累计结余 ${fmtSignedMoney(net)}</div>
+  </div>`;
+}
+
+function donutSVG(rows, label) {
+  const size = 168, cx = 84, cy = 84, r = 62, sw = 24;
+  const total = rows.reduce((s, x) => s + x.value, 0);
+  const C = 2 * Math.PI * r;
+  let acc = 0;
+  const circles = rows.map(seg => {
+    const len = seg.value / total * C;
+    const c = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${seg.color}" stroke-width="${sw}" stroke-dasharray="${len} ${C - len}" stroke-dashoffset="${-acc}" transform="rotate(-90 ${cx} ${cy})"></circle>`;
+    acc += len;
+    return c;
+  }).join('');
+  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+    <g>${circles}</g>
+    <text x="${cx}" y="${cy - 4}" text-anchor="middle" font-size="12" style="fill:var(--muted)">${esc(label)}</text>
+    <text x="${cx}" y="${cy + 15}" text-anchor="middle" font-size="15" font-weight="700" style="fill:var(--text)">¥${fmtAmount(total)}</text>
+  </svg>`;
+}
+
+function donutBlock(rows, label) {
+  const total = rows.reduce((s, x) => s + x.value, 0);
+  if (!rows.length || total <= 0) return '<div class="empty">暂无数据</div>';
+  const colored = rows.map((r, i) => ({ ...r, color: PALETTE[i % PALETTE.length] }));
+  const legend = colored.map(r => `
+    <div class="legend-item">
+      <span class="legend-dot" style="background:${r.color}"></span>
+      <span class="legend-name">${esc(r.name)}</span>
+      <span class="legend-val">${(r.value / total * 100).toFixed(0)}% · ¥${fmtAmount(r.value)}</span>
+    </div>`).join('');
+  return `<div class="donut-wrap">${donutSVG(colored, label)}<div class="legend">${legend}</div></div>`;
+}
+
+function legendHTML() {
+  return `<div class="legend-item" style="margin-top:6px"><span class="legend-dot" style="background:var(--income)"></span><span class="legend-name">收入</span></div>
+    <div class="legend-item" style="margin-bottom:0"><span class="legend-dot" style="background:var(--expense)"></span><span class="legend-name">支出</span></div>`;
+}
+
+function groupedBarSVG(series) {
+  const W = 340, H = 200, padL = 10, padR = 10, padT = 16, padB = 26;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const max = Math.max(1, ...series.map(s => Math.max(s.income, s.expense)));
+  const n = series.length || 1;
+  const groupW = innerW / n;
+  const barW = Math.min(14, groupW * 0.26);
+  const labelStep = n <= 15 ? 1 : Math.ceil(n / 8);
+  const yBase = padT + innerH;
+  let bars = '', labels = '';
+  for (let i = 0; i < n; i++) {
+    const s = series[i];
+    const cx = padL + groupW * i + groupW / 2;
+    const hi = s.income / max * innerH;
+    const he = s.expense / max * innerH;
+    if (s.income > 0) bars += `<rect x="${cx - barW - 0.5}" y="${yBase - hi}" width="${barW}" height="${hi}" rx="1.5" style="fill:var(--income)"><title>${s.label} 收入 ¥${fmtAmount(s.income)}</title></rect>`;
+    if (s.expense > 0) bars += `<rect x="${cx + 1.5}" y="${yBase - he}" width="${barW}" height="${he}" rx="1.5" style="fill:var(--expense)"><title>${s.label} 支出 ¥${fmtAmount(s.expense)}</title></rect>`;
+    if (i % labelStep === 0) labels += `<text x="${cx}" y="${H - 8}" text-anchor="middle" font-size="10" style="fill:var(--muted)">${esc(s.label)}</text>`;
+  }
+  return `<svg width="100%" viewBox="0 0 ${W} ${H}" role="img"><line x1="${padL}" y1="${yBase}" x2="${W - padR}" y2="${yBase}" stroke="var(--border)" stroke-width="1"></line>${bars}${labels}</svg>`;
+}
+
+/* ======================= 渲染：记账页 ======================= */
+function renderSummary() {
+  const { income, expense } = totalsForMonth(thisMonthStr());
+  monthSummary.innerHTML = summaryGridHTML(income, expense, { in: '本月收入', ox: '本月支出', bal: '本月结余' });
+}
+
+function renderBudget() {
+  const { expense } = totalsForMonth(thisMonthStr());
+  const monthly = state.budget.monthly;
+  if (!monthly || monthly <= 0) {
+    budgetBanner.innerHTML = `<div class="budget-none" id="gotoBudget">还没有设置每月预算，点这里设置 →</div>`;
+    const g = $('gotoBudget');
+    if (g) g.addEventListener('click', () => navigate('settings'));
+    return;
+  }
+  const pct = Math.round(expense / monthly * 100);
+  const cls = pct > 100 ? 'over' : pct >= 80 ? 'warn' : '';
+  const remain = monthly - expense;
+  const text = remain >= 0
+    ? `本月支出 ¥${fmtAmount(expense)} / 预算 ¥${fmtAmount(monthly)}（剩余 ¥${fmtAmount(remain)}）`
+    : `⚠️ 本月已超支 ¥${fmtAmount(-remain)}`;
+  budgetBanner.innerHTML = `
+    <div class="budget-bar">
+      <div class="budget-bar-text"><span>${pct}%</span><span>${esc(text)}</span></div>
+      <div class="budget-track"><div class="budget-fill ${cls}" style="width:${Math.min(pct, 100)}%"></div></div>
+    </div>`;
+}
+
+function renderTypeSeg() {
+  for (const btn of typeSeg.querySelectorAll('.seg-btn')) {
+    btn.classList.toggle('active', btn.dataset.type === tx.type);
+  }
+}
+
+/* ======================= 快捷键盘 ======================= */
+let kbText = '';
+
+function fmtKb(t) {
+  if (t === '' || t === '.') return '0';
+  const parts = t.split('.');
+  const intFmt = (parts[0] === '' ? '0' : Number(parts[0]).toLocaleString('en-US'));
+  return parts.length > 1 ? intFmt + '.' + parts[1] : intFmt;
+}
+
+function kbRender() { amountText.textContent = fmtKb(kbText); }
+
+function kbPress(k) {
+  if (k === 'back') { kbText = kbText.slice(0, -1); kbRender(); return; }
+  if (k === '.') {
+    if (kbText.includes('.')) return;
+    kbText = kbText === '' ? '0.' : kbText + '.';
+    kbRender(); return;
+  }
+  const digits = (k === '00') ? '00' : k;
+  const dot = kbText.indexOf('.');
+  if (dot >= 0) {
+    const dec = kbText.slice(dot + 1);
+    if (dec.length >= 2) return;
+    kbText = kbText + digits.slice(0, 2 - dec.length);
+  } else {
+    let intP = kbText + digits;
+    intP = intP.replace(/^0+(?=\d)/, '');
+    if (intP.length > 9) return;
+    kbText = intP;
+  }
+  kbRender();
+}
+
+function kbAmount() {
+  const v = parseFloat(kbText);
+  return isFinite(v) ? Math.round(v * 100) / 100 : 0;
+}
+
+/* ======================= 记住上次的选择（连记） ======================= */
+function loadUi() {
+  try {
+    const p = JSON.parse(localStorage.getItem(UI_KEY) || '{}');
+    return {
+      type: p.type === 'income' ? 'income' : 'expense',
+      category: typeof p.category === 'string' ? p.category : null,
+      accountId: typeof p.accountId === 'string' ? p.accountId : '',
+    };
+  } catch (e) { return { type: 'expense', category: null, accountId: '' }; }
+}
+
+function saveUi() {
+  try { localStorage.setItem(UI_KEY, JSON.stringify({ type: tx.type, category: tx.category, accountId: formAccountId })); } catch (e) {}
+}
+
+/* ======================= 分类：常用优先 ======================= */
+function frequentCats(type, n) {
+  const cutoff = Date.now() - 90 * 864e5;
+  const map = {};
+  for (const t of state.transactions) {
+    if (t.type !== type || (t.createdAt || 0) < cutoff || !t.category) continue;
+    map[t.category] = (map[t.category] || 0) + 1;
+  }
+  return Object.entries(map).sort((a, b) => b[1] - a[1]).slice(0, n || 6).map(e => e[0]);
+}
+
+function catChip(c) {
+  return `<button type="button" class="chip ${tx.type === 'expense' ? 'expense-chip' : ''} ${tx.category === c ? 'active' : ''}" data-action="pick-category" data-cat="${esc(c)}">` +
+    `<span class="chip-ico">${CATEGORY_ICON[c] || '📦'}</span>${esc(c)}</button>`;
+}
+
+function renderCats() {
+  const freq = frequentCats(tx.type, 6).filter(c => CATEGORIES[tx.type].includes(c));
+  if (freq.length) {
+    freqCatsEl.innerHTML = '<span class="chips-label">常用</span>' + freq.map(catChip).join('');
+    freqCatsEl.hidden = false;
+    const rest = CATEGORIES[tx.type].filter(c => !freq.includes(c));
+    categoryChipsEl.innerHTML = '<span class="chips-label">全部</span>' + rest.map(catChip).join('');
+  } else {
+    freqCatsEl.innerHTML = '';
+    freqCatsEl.hidden = true;
+    categoryChipsEl.innerHTML = CATEGORIES[tx.type].map(catChip).join('');
+  }
+}
+
+function pickCategory(cat) {
+  tx.category = cat;
+  saveUi();
+  renderCats();
+}
+
+function renderAccountSelect() {
+  if (!formAccountId || !state.accounts.some(a => a.id === formAccountId)) {
+    formAccountId = state.accounts.length ? state.accounts[0].id : '';
+  }
+  accountSelect.innerHTML = state.accounts.map(a =>
+    `<option value="${esc(a.id)}">${esc(a.icon)} ${esc(a.name)}</option>`).join('');
+  accountSelect.value = formAccountId;
+  accountSelect.disabled = state.accounts.length === 0;
+}
+
+/* ======================= 渲染：账单页 ======================= */
+function renderFilterSelects() {
+  const months = collectMonths();
+  filterMonth.innerHTML = '<option value="">全部月份</option>' +
+    months.map(m => `<option value="${m}">${monthLabel(m)}</option>`).join('');
+
+  filterCategory.innerHTML = '<option value="">全部分类</option>' +
+    `<optgroup label="收入">${CATEGORIES.income.map(c => `<option value="${c}">${c}</option>`).join('')}</optgroup>` +
+    `<optgroup label="支出">${CATEGORIES.expense.map(c => `<option value="${c}">${c}</option>`).join('')}</optgroup>`;
+
+  filterAccount.innerHTML = '<option value="">全部账户</option>' +
+    state.accounts.map(a => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
+
+  filters.month = months.includes(filters.month) ? filters.month : '';
+  filters.category = ALL_CAT_NAMES.includes(filters.category) ? filters.category : '';
+  filters.account = state.accounts.some(a => a.id === filters.account) ? filters.account : '';
+  filterMonth.value = filters.month;
+  filterCategory.value = filters.category;
+  filterAccount.value = filters.account;
+}
+
+function filteredTransactions() {
+  const kw = searchInput.value.trim().toLowerCase();
+  return state.transactions.filter(t => {
+    if (filters.type && t.type !== filters.type) return false;
+    if (filters.month && t.date && t.date.slice(0, 7) !== filters.month) return false;
+    if (filters.category && t.category !== filters.category) return false;
+    if (filters.account && t.accountId !== filters.account) return false;
+    if (kw) {
+      const hay = `${t.category} ${t.note} ${t.accountName} ${t.amount}`.toLowerCase();
+      if (!hay.includes(kw)) return false;
+    }
+    return true;
+  }).sort(byDateDesc);
+}
+
+function renderList() {
+  const list = filteredTransactions();
+  let income = 0, expense = 0;
+  for (const t of list) { if (t.type === 'income') income += t.amount; else expense += t.amount; }
+
+  if (!list.length) {
+    listSummary.innerHTML = '';
+    txList.innerHTML = `<div class="empty"><span class="empty-ico">🗒️</span>还没有符合条件的账单</div>`;
+    return;
+  }
+
+  listSummary.innerHTML = `共 ${list.length} 笔 · 收入 ¥${fmtAmount(income)} · 支出 ¥${fmtAmount(expense)}`;
+
+  let html = '';
+  let lastDate = null;
+  for (const t of list) {
+    if (t.date !== lastDate) {
+      html += `<div class="tx-group-date">${esc(dateLabel(t.date))}</div>`;
+      lastDate = t.date;
+    }
+    html += `
+      <div class="tx-item" data-id="${esc(t.id)}">
+        <div class="tx-ico">${esc(t.categoryIcon || '📦')}</div>
+        <div class="tx-main">
+          <div class="tx-title">${esc(t.category)}${t.note ? ` <span style="color:var(--muted);font-weight:400">· ${esc(t.note)}</span>` : ''}</div>
+          <div class="tx-sub">${esc(t.accountIcon || '❓')} ${esc(t.accountName)}</div>
+        </div>
+        <div class="tx-amount ${t.type}">${t.type === 'income' ? '+' : '−'}¥${fmtAmount(t.amount)}</div>
+        <div class="tx-ops">
+          <button class="op-btn" data-action="edit" data-id="${esc(t.id)}" title="编辑">✎</button>
+          <button class="op-btn" data-action="delete" data-id="${esc(t.id)}" title="删除">🗑</button>
+        </div>
+      </div>`;
+  }
+  txList.innerHTML = html;
+}
+
+/* ======================= 渲染：统计页 ======================= */
+function renderStatsNav() {
+  document.querySelectorAll('.stats-sub').forEach(el => el.classList.toggle('active', el.id === 'stats-' + statsSub));
+  document.querySelectorAll('.subnav-btn').forEach(b => b.classList.toggle('active', b.dataset.stat === statsSub));
+}
+
+function renderOverview() {
+  const totalIn = totalIncome(), totalOut = totalExpense();
+  const net = totalIn - totalOut;
+  ovAssets.innerHTML = assetCardHTML();
+  ovSummary.innerHTML = summaryGridHTML(totalIn, totalOut, { in: '累计收入', ox: '累计支出', bal: '累计结余' });
+
+  const count = state.transactions.length;
+  let days = 0;
+  const dates = state.transactions.map(t => t.date).filter(Boolean).sort();
+  if (dates.length) {
+    const first = new Date(dates[0] + 'T00:00:00');
+    const now = new Date(); now.setHours(0, 0, 0, 0);
+    days = Math.max(1, Math.round((now - first) / 86400000) + 1);
+  }
+  const avgDaily = days ? totalOut / days : 0;
+  const saveRate = totalIn > 0 ? net / totalIn * 100 : 0;
+
+  const exps = state.transactions.filter(t => t.type === 'expense');
+  let maxExp = null;
+  for (const t of exps) if (!maxExp || t.amount > maxExp.amount) maxExp = t;
+
+  const catMap = {};
+  for (const t of exps) catMap[t.category] = (catMap[t.category] || 0) + t.amount;
+  const topCat = Object.entries(catMap).sort((a, b) => b[1] - a[1])[0];
+
+  const accMap = {};
+  for (const t of exps) accMap[t.accountName] = (accMap[t.accountName] || 0) + t.amount;
+  const topAcc = Object.entries(accMap).sort((a, b) => b[1] - a[1])[0];
+
+  let topMonth = null, maxMonthOut = 0;
+  for (const m of collectMonths()) {
+    const o = totalsForMonth(m).expense;
+    if (o > maxMonthOut) { maxMonthOut = o; topMonth = m; }
+  }
+
+  const items = [
+    ['记账笔数', `${count} 笔`],
+    ['结余率', `${saveRate.toFixed(1)}%`],
+    ['日均支出', `¥${fmtAmount(avgDaily)}`],
+  ];
+  if (maxExp) items.push(['最大单笔支出', `¥${fmtAmount(maxExp.amount)}（${maxExp.category} · ${maxExp.date}）`]);
+  if (topCat) items.push(['最大支出分类', `${topCat[0]} ¥${fmtAmount(topCat[1])}`]);
+  if (topAcc) items.push(['最大支出账户', `${topAcc[0]} ¥${fmtAmount(topAcc[1])}`]);
+  if (topMonth && maxMonthOut > 0) items.push(['支出最多月份', `${monthLabel(topMonth)} ¥${fmtAmount(maxMonthOut)}`]);
+
+  analysisList.innerHTML = items.map(([k, v]) => `
+    <div class="analysis-item"><span class="analysis-key">${esc(k)}</span><span class="analysis-value">${esc(v)}</span></div>`).join('');
+}
+
+function renderStatsSelect() {
+  const months = collectMonths();
+  const cur = thisMonthStr();
+  const options = months.includes(cur) ? months : [cur, ...months];
+  statsMonth.innerHTML = options.map(m => `<option value="${m}">${monthLabel(m)}</option>`).join('');
+  if (!options.includes(statsMonthValue)) statsMonthValue = options[0];
+  statsMonth.value = statsMonthValue;
+}
+
+function renderMonthStats() {
+  renderStatsSelect();
+  const { income, expense } = totalsForMonth(statsMonthValue);
+  statsSummary.innerHTML = summaryGridHTML(income, expense, {});
+  const expMap = {}, incMap = {};
+  for (const t of state.transactions) {
+    if (t.date && t.date.slice(0, 7) === statsMonthValue) {
+      const mm = t.type === 'income' ? incMap : expMap;
+      mm[t.category] = (mm[t.category] || 0) + t.amount;
+    }
+  }
+  const expRows = Object.entries(expMap).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
+  const incRows = Object.entries(incMap).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
+  donut.innerHTML = donutBlock(expRows, '总支出');
+  incomeDonut.innerHTML = donutBlock(incRows, '总收入');
+}
+
+function dailyChartSVG(series, avgDaily, todayDay) {
+  const W = 360, H = 252, padL = 46, padR = 16, padT = 18, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const rawMax = Math.max(1, avgDaily, ...series.map(s => Math.max(s.income, s.expense)));
+  const step = niceCeil(rawMax / 4);
+  const yMax = step * 4;
+  const x = i => padL + plotW * (i + 0.5) / series.length;
+  const y = v => padT + plotH - (v / yMax) * plotH;
+  const yBase = y(0);
+
+  let grid = '', yLabels = '';
+  for (let t = 0; t <= yMax + 0.001; t += step) {
+    const yy = y(t);
+    grid += `<line x1="${padL}" y1="${yy}" x2="${W - padR}" y2="${yy}" stroke="var(--border)"></line>`;
+    yLabels += `<text x="${padL - 6}" y="${yy + 3}" text-anchor="end" font-size="9" style="fill:var(--muted)">¥${fmtShort(t)}</text>`;
+  }
+
+  let avgLine = '';
+  if (avgDaily > 0) {
+    const ay = y(avgDaily);
+    avgLine = `<line x1="${padL}" y1="${ay}" x2="${W - padR}" y2="${ay}" stroke="var(--warn)" stroke-dasharray="4 3"></line>
+      <text x="${W - padR - 2}" y="${ay - 4}" text-anchor="end" font-size="9" style="fill:var(--warn)">日均 ¥${fmtShort(avgDaily)}</text>`;
+  }
+
+  const barW = Math.max(3, Math.min(10, plotW / series.length * 0.5));
+  let bars = '', pts = [], dots = '';
+  for (let i = 0; i < series.length; i++) {
+    const s = series[i];
+    const cx = x(i);
+    if (s.expense > 0) {
+      const yy = y(s.expense);
+      bars += `<rect x="${cx - barW / 2}" y="${yy}" width="${barW}" height="${Math.max(1, yBase - yy)}" rx="2" style="fill:var(--expense)"><title>${s.day}日 支出 ¥${fmtAmount(s.expense)}</title></rect>`;
+      bars += `<text x="${cx}" y="${yy - 3}" text-anchor="middle" font-size="8" style="fill:var(--expense)">${fmtShort(s.expense)}</text>`;
+    }
+    pts.push(`${cx.toFixed(1)},${y(s.income).toFixed(1)}`);
+    if (s.income > 0) dots += `<circle cx="${cx}" cy="${y(s.income)}" r="2.2" style="fill:var(--income)"><title>${s.day}日 收入 ¥${fmtAmount(s.income)}</title></circle>`;
+  }
+  const line = `<polyline points="${pts.join(' ')}" fill="none" stroke="var(--income)" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"></polyline>`;
+
+  const stepL = Math.ceil(series.length / 10);
+  let xLabels = '';
+  for (let i = 0; i < series.length; i++) {
+    if (i % stepL === 0) {
+      const d = series[i].day;
+      const isToday = d === todayDay;
+      xLabels += `<text x="${x(i)}" y="${H - 8}" text-anchor="middle" font-size="9" ${isToday ? 'font-weight="700"' : ''} style="fill:${isToday ? 'var(--income)' : 'var(--muted)'}">${d}</text>`;
+    }
+  }
+
+  return `<svg width="100%" viewBox="0 0 ${W} ${H}" role="img">${grid}${avgLine}<line x1="${padL}" y1="${yBase}" x2="${W - padR}" y2="${yBase}" stroke="var(--muted)" stroke-width="1"></line>${bars}${line}${dots}${yLabels}${xLabels}</svg>`;
+}
+
+function dailyLegend() {
+  return `<div class="legend-item" style="margin-top:6px"><span class="legend-dot" style="background:var(--expense)"></span><span class="legend-name">支出（柱）</span></div>
+    <div class="legend-item" style="margin-bottom:0"><span class="legend-dot" style="background:var(--income)"></span><span class="legend-name">收入（折线）</span></div>`;
+}
+
+function renderDayList() {
+  const map = {};
+  for (const t of state.transactions) {
+    if (t.date && t.date.slice(0, 7) === dayMonthValue) {
+      const m = map[t.date] || (map[t.date] = { income: 0, expense: 0 });
+      if (t.type === 'income') m.income += t.amount; else m.expense += t.amount;
+    }
+  }
+  const days = Object.keys(map).sort((a, b) => (a < b ? 1 : -1));
+  if (!days.length) { dayList.innerHTML = '<div class="empty">这个月还没有记账</div>'; return; }
+  dayList.innerHTML = days.map(d => {
+    const n = Number(d.slice(8));
+    const wd = weekdayCN(d);
+    const m = map[d];
+    let parts = '';
+    if (m.income > 0) parts += `<span class="day-in">收 ¥${fmtAmount(m.income)}</span>`;
+    if (m.expense > 0) parts += `<span class="day-out">支 ¥${fmtAmount(m.expense)}</span>`;
+    return `<div class="day-row">
+      <span class="day-label">${n}日 <span class="day-week">${wd}</span></span>
+      <span class="day-amounts">${parts}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderDayStats() {
+  const months = collectMonths();
+  const cur = thisMonthStr();
+  const options = months.includes(cur) ? months : [cur, ...months];
+  dayMonth.innerHTML = options.map(m => `<option value="${m}">${monthLabel(m)}</option>`).join('');
+  if (!options.includes(dayMonthValue)) dayMonthValue = options[0];
+  dayMonth.value = dayMonthValue;
+
+  const [yy, mm] = dayMonthValue.split('-').map(Number);
+  const dnum = daysInMonth(yy, mm);
+  const series = [];
+  let totalIn = 0, totalOut = 0;
+  for (let d = 1; d <= dnum; d++) {
+    const ds = `${dayMonthValue}-${pad2(d)}`;
+    let income = 0, expense = 0;
+    for (const t of state.transactions) if (t.date === ds) { if (t.type === 'income') income += t.amount; else expense += t.amount; }
+    series.push({ day: d, income, expense });
+    totalIn += income; totalOut += expense;
+  }
+  const avgDaily = totalOut / dnum;
+  const todayDay = dayMonthValue === thisMonthStr() ? new Date().getDate() : -1;
+  daySummary.innerHTML = summaryGridHTML(totalIn, totalOut, {});
+  dayChart.innerHTML = dailyChartSVG(series, avgDaily, todayDay) + dailyLegend();
+  renderDayList();
+}
+
+function renderYearStats() {
+  const years = collectYears();
+  yearSelect.innerHTML = years.map(y => `<option value="${y}">${y}年</option>`).join('');
+  if (!years.includes(yearValue)) yearValue = years[0];
+  yearSelect.value = yearValue;
+
+  const y = Number(yearValue);
+  let yin = 0, yout = 0;
+  const series = [];
+  for (let m = 1; m <= 12; m++) {
+    const tt = totalsForMonth(`${y}-${pad2(m)}`);
+    yin += tt.income; yout += tt.expense;
+    series.push({ label: `${m}月`, income: tt.income, expense: tt.expense });
+  }
+  yearSummary.innerHTML = summaryGridHTML(yin, yout, { in: '本年收入', ox: '本年支出', bal: '本年结余' });
+  yearBar.innerHTML = groupedBarSVG(series) + legendHTML();
+
+  yearCompare.innerHTML = years.map(yr => {
+    let yi = 0, yo = 0;
+    for (let m = 1; m <= 12; m++) { const tt = totalsForMonth(`${yr}-${pad2(m)}`); yi += tt.income; yo += tt.expense; }
+    const net = yi - yo;
+    return `<div class="year-row">
+      <span class="year-name">${yr}年</span>
+      <span class="year-cell">收 ¥${fmtAmount(yi)}</span>
+      <span class="year-cell">支 ¥${fmtAmount(yo)}</span>
+      <span class="year-cell ${net > 0 ? 'pos' : net < 0 ? 'neg' : ''}">结余 ${fmtSignedMoney(net)}</span>
+    </div>`;
+  }).join('') || '<div class="empty">暂无数据</div>';
+}
+
+function renderAccountStats() {
+  const expRows = state.accounts.map(a => ({ name: a.name, value: accountTotals(a.id).expense }))
+    .filter(r => r.value > 0).sort((a, b) => b.value - a.value);
+  const incRows = state.accounts.map(a => ({ name: a.name, value: accountTotals(a.id).income }))
+    .filter(r => r.value > 0).sort((a, b) => b.value - a.value);
+  accountDonut.innerHTML = donutBlock(expRows, '总支出');
+  incomeAccountDonut.innerHTML = donutBlock(incRows, '总收入');
+
+  accountBreakdown.innerHTML = state.accounts.map(a => {
+    const tot = accountTotals(a.id);
+    return `<div class="account-item">
+      <span class="acc-ico">${esc(a.icon)}</span>
+      <div class="acc-info">
+        <div class="acc-name">${esc(a.name)}</div>
+        <div class="acc-balance ${tot.current > 0 ? 'pos' : tot.current < 0 ? 'neg' : ''}">余额 ${fmtSignedMoney(tot.current)}</div>
+      </div>
+      <div class="acc-stats">
+        <div class="acc-line">初始 ¥${fmtAmount(a.initialBalance || 0)}</div>
+        <div class="acc-line">收 ¥${fmtAmount(tot.income)} · 支 ¥${fmtAmount(tot.expense)}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* ======================= 渲染：设置页 ======================= */
+function renderSettings() {
+  budgetInput.value = state.budget.monthly > 0 ? String(state.budget.monthly) : '';
+
+  accountList.innerHTML = state.accounts.map(a => {
+    const tot = accountTotals(a.id);
+    return `<div class="account-item">
+      <span class="acc-ico">${esc(a.icon)}</span>
+      <div class="acc-info">
+        <div class="acc-name">${esc(a.name)}</div>
+        <div class="acc-balance ${tot.current > 0 ? 'pos' : tot.current < 0 ? 'neg' : ''}">余额 ${fmtSignedMoney(tot.current)}</div>
+        <div class="acc-line">收 ${fmtSignedMoney(tot.income)} · 支 ${fmtSignedMoney(tot.expense)}</div>
+      </div>
+      <span class="acc-tools">
+        <button class="op-btn link" data-action="edit-account" data-id="${esc(a.id)}" title="点这里设置/修改「初始余额」">初始 ${fmtSignedMoney(a.initialBalance || 0)} ✎</button>
+        <button class="op-btn" data-action="del-account" data-id="${esc(a.id)}" title="删除账户">🗑</button>
+      </span>
+    </div>`;
+  }).join('');
+
+  for (const b of themeSeg.querySelectorAll('.seg-btn')) {
+    b.classList.toggle('active', b.dataset.themeOpt === state.theme);
+  }
+}
+
+/* ======================= 渲染：财务便签 ======================= */
+function noteDateLabel(ts) {
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '';
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const that = new Date(d); that.setHours(0, 0, 0, 0);
+  const diff = Math.round((today - that) / 86400000);
+  if (diff === 0) return '今天';
+  if (diff === 1) return '昨天';
+  return `${d.getMonth() + 1}月${d.getDate()}日`;
+}
+
+function renderNotes() {
+  const pending = state.notes.filter(n => !n.done).length;
+  const done = state.notes.length - pending;
+  notesSummary.innerHTML = `待处理 ${pending} 条 · 已完成 ${done} 条`;
+
+  if (!state.notes.length) {
+    notesList.innerHTML = `<div class="empty"><span class="empty-ico">📌</span>还没有便签，写一条要处理的财务事项吧</div>`;
+    return;
+  }
+  const sorted = [...state.notes].sort((a, b) =>
+    a.done === b.done ? (b.createdAt - a.createdAt) : (a.done ? 1 : -1));
+  notesList.innerHTML = sorted.map(n => `
+    <div class="note-item ${n.done ? 'done' : ''}" data-id="${esc(n.id)}">
+      <button class="note-check" data-action="toggle-note" data-id="${esc(n.id)}" aria-label="切换完成状态">${n.done ? '✅' : '⬜'}</button>
+      <div class="note-content">
+        <div class="note-text">${esc(n.content)}</div>
+        <div class="note-date">${noteDateLabel(n.createdAt)}</div>
+      </div>
+      <button class="op-btn" data-action="edit-note" data-id="${esc(n.id)}" title="编辑">✎</button>
+      <button class="op-btn" data-action="del-note" data-id="${esc(n.id)}" title="删除">🗑</button>
+    </div>`).join('');
+}
+
+function endNoteEdit() {
+  editingNoteId = null;
+  addNoteBtn.textContent = '添加';
+  cancelNoteEditBtn.hidden = true;
+  memoInput.value = '';
+}
+
+function submitNote() {
+  const content = memoInput.value.trim();
+  if (!content) { toast('请输入便签内容'); return; }
+  const wasEditing = editingNoteId;
+  if (wasEditing) {
+    const n = state.notes.find(x => x.id === wasEditing);
+    if (n) n.content = content;
+  } else {
+    state.notes.push({ id: genId(), content, done: false, createdAt: Date.now() });
+  }
+  endNoteEdit();
+  save();
+  renderNotes();
+  toast(wasEditing ? '已更新' : '已添加');
+}
+
+function startNoteEdit(id) {
+  const n = state.notes.find(x => x.id === id);
+  if (!n) return;
+  editingNoteId = id;
+  memoInput.value = n.content;
+  addNoteBtn.textContent = '保存';
+  cancelNoteEditBtn.hidden = false;
+  memoInput.focus();
+}
+
+function toggleNote(id) {
+  const n = state.notes.find(x => x.id === id);
+  if (!n) return;
+  n.done = !n.done;
+  save();
+  renderNotes();
+}
+
+function deleteNote(id) {
+  if (!confirm('确定删除这条便签吗？')) return;
+  state.notes = state.notes.filter(n => n.id !== id);
+  if (editingNoteId === id) endNoteEdit();
+  save();
+  renderNotes();
+  toast('已删除');
+}
+
+/* ======================= 渲染：借贷 ======================= */
+function loanTotals() {
+  let lend = 0, borrow = 0;
+  for (const l of state.loans) {
+    if (l.settled) continue;
+    if (l.type === 'lend') lend += l.amount; else borrow += l.amount;
+  }
+  return { lend, borrow, net: lend - borrow };
+}
+
+function renderLoanTypeSeg() {
+  for (const b of loanTypeSeg.querySelectorAll('.seg-btn')) {
+    b.classList.toggle('active', b.dataset.ltype === loanType);
+  }
+}
+
+function renderLoanSummary() {
+  const { lend, borrow, net } = loanTotals();
+  loanSummary.innerHTML = `
+    <div class="sum-card sum-income"><div class="sum-label">借出未收回</div><div class="sum-value">¥${fmtAmount(lend)}</div></div>
+    <div class="sum-card sum-expense"><div class="sum-label">借入未还</div><div class="sum-value">¥${fmtAmount(borrow)}</div></div>
+    <div class="sum-card sum-balance"><div class="sum-label">净额</div><div class="sum-value ${net < 0 ? 'neg' : ''}">${fmtSignedMoney(net)}</div></div>`;
+}
+
+function renderLoanList() {
+  const sorted = [...state.loans].sort((a, b) =>
+    a.settled === b.settled ? (b.createdAt - a.createdAt) : (a.settled ? 1 : -1));
+  if (!sorted.length) {
+    loanList.innerHTML = `<div class="empty"><span class="empty-ico">🤝</span>还没有借贷记录，记一笔借出或借入吧</div>`;
+    return;
+  }
+  loanList.innerHTML = sorted.map(l => {
+    const isLend = l.type === 'lend';
+    return `<div class="loan-item ${l.settled ? 'settled' : ''}" data-id="${esc(l.id)}">
+      <span class="loan-badge ${isLend ? 'lend' : 'borrow'}">${isLend ? '借出' : '借入'}</span>
+      <div class="loan-main">
+        <div class="loan-title">${esc(l.person)}${l.note ? ` <span class="loan-note">· ${esc(l.note)}</span>` : ''}</div>
+        <div class="loan-sub">${esc(l.date)} · ${l.settled ? '已还清' : '未还'}</div>
+      </div>
+      <div class="loan-amount ${isLend ? 'income' : 'expense'}">${isLend ? '+' : '−'}¥${fmtAmount(l.amount)}</div>
+      <div class="tx-ops">
+        <button class="op-btn" data-action="toggle-loan" data-id="${esc(l.id)}" title="${l.settled ? '标记未还' : '标记已还清'}">${l.settled ? '↩️' : '✅'}</button>
+        <button class="op-btn" data-action="edit-loan" data-id="${esc(l.id)}" title="编辑">✎</button>
+        <button class="op-btn" data-action="del-loan" data-id="${esc(l.id)}" title="删除">🗑</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderLoans() {
+  renderLoanSummary();
+  renderLoanList();
+}
+
+function endLoanEdit() {
+  editingLoanId = null;
+  loanSaveBtn.textContent = '添加';
+  loanCancelEditBtn.hidden = true;
+  loanAmount.value = '';
+  loanPerson.value = '';
+  loanNote.value = '';
+  loanDate.value = todayStr();
+}
+
+function submitLoan(e) {
+  e.preventDefault();
+  const amount = parseFloat(loanAmount.value);
+  if (!isFinite(amount) || amount <= 0) { toast('请输入正确的金额'); return; }
+  const person = loanPerson.value.trim();
+  if (!person) { toast('请输入对方姓名'); return; }
+  const data = {
+    id: editingLoanId || genId(),
+    type: loanType,
+    amount: Math.round(amount * 100) / 100,
+    person,
+    note: loanNote.value.trim(),
+    date: loanDate.value || todayStr(),
+    settled: false,
+    createdAt: Date.now(),
+  };
+  if (editingLoanId) {
+    const i = state.loans.findIndex(x => x.id === editingLoanId);
+    if (i >= 0) { data.settled = state.loans[i].settled; data.createdAt = state.loans[i].createdAt || Date.now(); state.loans[i] = data; }
+  } else {
+    state.loans.push(data);
+  }
+  save();
+  endLoanEdit();
+  renderLoans();
+  toast('已保存');
+}
+
+function startLoanEdit(id) {
+  const l = state.loans.find(x => x.id === id);
+  if (!l) return;
+  editingLoanId = id;
+  loanType = l.type;
+  loanAmount.value = String(l.amount);
+  loanPerson.value = l.person;
+  loanNote.value = l.note || '';
+  loanDate.value = l.date || todayStr();
+  loanSaveBtn.textContent = '保存修改';
+  loanCancelEditBtn.hidden = false;
+  renderLoanTypeSeg();
+}
+
+function toggleLoan(id) {
+  const l = state.loans.find(x => x.id === id);
+  if (!l) return;
+  l.settled = !l.settled;
+  save();
+  renderLoans();
+}
+
+function deleteLoan(id) {
+  if (!confirm('确定删除这条借贷记录吗？')) return;
+  state.loans = state.loans.filter(x => x.id !== id);
+  if (editingLoanId === id) endLoanEdit();
+  save();
+  renderLoans();
+}
+
+/* ======================= 总渲染 ======================= */
+function render() {
+  renderSummary();
+  renderBudget();
+  renderTypeSeg();
+  renderCats();
+  renderAccountSelect();
+  renderFilterSelects();
+  renderList();
+  renderNotes();
+  renderLoanTypeSeg();
+  renderLoans();
+  renderStatsNav();
+  renderOverview();
+  renderMonthStats();
+  renderDayStats();
+  renderYearStats();
+  renderAccountStats();
+  renderSettings();
+}
+
+/* ======================= 导航 ======================= */
+function navigate(view) {
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
+  window.scrollTo({ top: 0 });
+}
+
+/* ======================= 记账表单操作 ======================= */
+function resetForm() {
+  editingId = null;
+  kbText = '';
+  noteInput.value = '';
+  dateInput.value = todayStr();
+  saveBtn.textContent = '记一笔';
+  cancelEditBtn.hidden = true;
+  lastSavedEl.hidden = true;
+  // 连记模式：类型、分类、账户保持不动，只清金额和备注
+  if (!CATEGORIES[tx.type].includes(tx.category)) tx.category = null;
+  if (!state.accounts.some(a => a.id === formAccountId)) formAccountId = state.accounts[0] ? state.accounts[0].id : '';
+  kbRender();
+  renderTypeSeg();
+  renderCats();
+  renderAccountSelect();
+}
+
+function submitTx() {
+  const amount = kbAmount();
+  if (!(amount > 0)) { toast('请先输入金额'); return; }
+  if (!tx.category) { toast('请选择一个分类'); return; }
+  const account = state.accounts.find(a => a.id === formAccountId);
+  const record = {
+    id: editingId || genId(),
+    type: tx.type,
+    amount: amount,
+    category: tx.category,
+    categoryIcon: CATEGORY_ICON[tx.category] || '📦',
+    accountId: account ? account.id : '',
+    accountName: account ? account.name : '未选择账户',
+    accountIcon: account ? account.icon : '❓',
+    date: dateInput.value || todayStr(),
+    note: noteInput.value.trim(),
+    createdAt: Date.now(),
+  };
+
+  if (editingId) {
+    const i = state.transactions.findIndex(t => t.id === editingId);
+    if (i >= 0) { record.createdAt = state.transactions[i].createdAt || record.createdAt; state.transactions[i] = record; }
+  } else {
+    state.transactions.push(record);
+  }
+  save();
+  saveUi();
+  editingId = null;
+  saveBtn.textContent = '记一笔';
+  cancelEditBtn.hidden = true;
+  // 连记：只清金额和备注，分类/账户/类型保留；给出本次确认
+  lastSavedEl.hidden = false;
+  lastSavedEl.textContent = `已记${tx.type === 'expense' ? '支出' : '收入'} ¥${fmtAmount(record.amount)} · ${record.category}，继续记下一笔`;
+  kbText = '';
+  noteInput.value = '';
+  dateInput.value = todayStr();
+  kbRender();
+  render();
+  if (navigator.vibrate) { try { navigator.vibrate(15); } catch (e) {} }
+}
+
+function startEdit(id) {
+  const t = state.transactions.find(x => x.id === id);
+  if (!t) return;
+  editingId = id;
+  tx.type = t.type;
+  tx.category = t.category;
+  kbText = String(t.amount);
+  noteInput.value = t.note || '';
+  dateInput.value = t.date || todayStr();
+  formAccountId = t.accountId || '';
+  saveBtn.textContent = '保存修改';
+  cancelEditBtn.hidden = false;
+  lastSavedEl.hidden = true;
+  kbRender();
+  renderTypeSeg();
+  renderCats();
+  renderAccountSelect();
+  navigate('add');
+}
+
+function deleteTx(id) {
+  if (!confirm('确定删除这笔账单吗？')) return;
+  state.transactions = state.transactions.filter(t => t.id !== id);
+  save();
+  if (editingId === id) resetForm();
+  render();
+  toast('已删除');
+}
+
+/* ======================= 设置操作 ======================= */
+function addAccount() {
+  const name = $('newAccountName').value.trim();
+  if (!name) { toast('请输入账户名称'); return; }
+  if (/^[-+]?\d+(\.\d+)?$/.test(name)) { toast('账户名称不能是纯数字——金额请填到「初始余额」里'); return; }
+  if (state.accounts.some(a => a.name === name)) { toast('账户名称已存在'); return; }
+  const init = parseFloat($('newAccountInit').value);
+  state.accounts.push({
+    id: genId(),
+    name,
+    icon: $('newAccountIcon').value,
+    initialBalance: isFinite(init) ? Math.round(init * 100) / 100 : 0,
+  });
+  save();
+  $('newAccountName').value = '';
+  $('newAccountInit').value = '';
+  render();
+  toast('账户已添加');
+}
+
+function deleteAccount(id) {
+  if (state.accounts.length <= 1) { toast('至少保留一个账户'); return; }
+  const a = state.accounts.find(x => x.id === id);
+  if (!confirm(`确定删除账户「${a ? a.name : ''}」吗？已有的账单不会被删除。`)) return;
+  state.accounts = state.accounts.filter(x => x.id !== id);
+  save();
+  render();
+  toast('账户已删除');
+}
+
+function mergeInto(base, src) {
+  base.initialBalance = (base.initialBalance || 0) + (src.initialBalance || 0);
+  for (const t of state.transactions) {
+    if (t.accountId === src.id) {
+      t.accountId = base.id;
+      t.accountName = base.name;
+      t.accountIcon = base.icon;
+    }
+  }
+  state.accounts = state.accounts.filter(a => a.id !== src.id);
+}
+
+function mergeAccountsByIcon() {
+  const groups = new Map();
+  for (const a of state.accounts) {
+    if (!groups.has(a.icon)) groups.set(a.icon, []);
+    groups.get(a.icon).push(a);
+  }
+  const dups = [...groups.values()].filter(g => g.length > 1);
+  if (!dups.length) { toast('没有相同图标的重复账户'); return; }
+  const lines = dups.map(g => g.map(a => a.name).join('　＋　')).join('\n');
+  if (!confirm(`将把相同图标的账户合并成一个（保留每组第一个账户的名字，其余账户的账单和余额都并进去）：\n${lines}\n\n确定合并吗？`)) return;
+  for (const g of dups) {
+    const base = g[0];
+    for (const src of g.slice(1)) mergeInto(base, src);
+  }
+  save();
+  render();
+  toast('已合并相同图标的账户');
+}
+
+function editAccountInitial(id) {
+  const a = state.accounts.find(x => x.id === id);
+  if (!a) return;
+  openNumberModal(`「${a.name}」的初始余额`, a.initialBalance || 0,
+    '填刚开始记账时，这个账户里已经有多少钱（信用卡欠款可填负数）',
+    v => { a.initialBalance = v; save(); render(); toast('初始余额已更新'); });
+}
+
+function saveBudget() {
+  const v = parseFloat(budgetInput.value);
+  state.budget.monthly = isFinite(v) && v >= 0 ? Math.round(v * 100) / 100 : 0;
+  save();
+  render();
+  toast('预算已保存');
+}
+
+/* ======================= 弹窗 ======================= */
+let modalCb = null;
+function openNumberModal(title, value, hint, cb) {
+  $('modalTitle').textContent = title;
+  $('modalHint').textContent = hint || '';
+  $('modalInput').value = value ? String(value) : '';
+  modalCb = cb;
+  $('modal').hidden = false;
+  setTimeout(() => { const i = $('modalInput'); if (i && i.focus) i.focus(); }, 60);
+}
+function closeModal() { $('modal').hidden = true; modalCb = null; }
+
+/* ======================= 导出 / 导入 ======================= */
+function exportCSV() {
+  if (!state.transactions.length) { toast('暂无数据可导出'); return; }
+  const rows = [['日期', '类型', '分类', '账户', '金额', '备注']];
+  for (const t of [...state.transactions].sort(byDateDesc)) {
+    rows.push([t.date, t.type === 'income' ? '收入' : '支出', t.category, t.accountName, t.amount.toFixed(2), t.note || '']);
+  }
+  const csv = '\ufeff' + rows.map(r => r.map(csvCell).join(',')).join('\r\n');
+  download(csv, '轻记账-账单.csv', 'text/csv;charset=utf-8');
+  toast('已导出 CSV');
+}
+
+function csvCell(v) {
+  const s = String(v == null ? '' : v);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+function exportJSON() {
+  download(JSON.stringify(state, null, 2), '轻记账-完整备份.json', 'application/json');
+  toast('已导出完整备份');
+}
+
+function importJSON(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const p = JSON.parse(reader.result);
+      if (!Array.isArray(p.transactions)) { toast('备份文件格式不正确'); return; }
+      if (!confirm('导入会覆盖当前所有数据，确定继续吗？')) return;
+      const d = defaultState();
+      const accounts = Array.isArray(p.accounts) && p.accounts.length ? normalizeAccounts(p.accounts) : d.accounts;
+      state = {
+        transactions: p.transactions,
+        accounts,
+        budget: { monthly: Number(p.budget && p.budget.monthly) || 0 },
+        notes: Array.isArray(p.notes) ? p.notes : [],
+        loans: Array.isArray(p.loans) ? p.loans : [],
+        theme: ['auto', 'light', 'dark'].includes(p.theme) ? p.theme : d.theme,
+      };
+      save();
+      resetForm();
+      applyTheme();
+      render();
+      toast('备份已导入');
+    } catch (e) {
+      toast('文件解析失败');
+    }
+  };
+  reader.readAsText(file);
+}
+
+function download(content, filename, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 800);
+}
+
+function clearData() {
+  if (!confirm('确定清空所有记账数据吗？此操作不可恢复，建议先导出备份。')) return;
+  if (!confirm('再次确认：真的要清空吗？')) return;
+  state = defaultState();
+  save();
+  resetForm();
+  render();
+  toast('已清空');
+}
+
+/* ======================= 事件绑定 ======================= */
+function bindEvents() {
+  typeSeg.addEventListener('click', e => {
+    const btn = e.target.closest('[data-type]');
+    if (!btn) return;
+    const t = btn.dataset.type;
+    if (tx.type !== t) { tx.type = t; tx.category = null; saveUi(); }
+    renderTypeSeg();
+    renderCats();
+  });
+
+  const onPickCategory = e => {
+    const chip = e.target.closest('[data-action="pick-category"]');
+    if (!chip) return;
+    pickCategory(chip.dataset.cat);
+  };
+  categoryChipsEl.addEventListener('click', onPickCategory);
+  freqCatsEl.addEventListener('click', onPickCategory);
+
+  keypadEl.addEventListener('click', e => {
+    const btn = e.target.closest('[data-k]');
+    if (!btn) return;
+    kbPress(btn.dataset.k);
+  });
+
+  accountSelect.addEventListener('change', () => { formAccountId = accountSelect.value; saveUi(); });
+  saveBtn.addEventListener('click', submitTx);
+  cancelEditBtn.addEventListener('click', resetForm);
+  $('themeToggle').addEventListener('click', () => {
+    const order = ['auto', 'light', 'dark'];
+    state.theme = order[(order.indexOf(state.theme) + 1) % order.length];
+    save(); applyTheme(); renderSettings();
+  });
+
+  searchInput.addEventListener('input', renderList);
+  filterMonth.addEventListener('change', () => { filters.month = filterMonth.value; renderList(); });
+  filterCategory.addEventListener('change', () => { filters.category = filterCategory.value; renderList(); });
+  filterAccount.addEventListener('change', () => { filters.account = filterAccount.value; renderList(); });
+  $('filterType').addEventListener('change', e => { filters.type = e.target.value; renderList(); });
+  $('clearFiltersBtn').addEventListener('click', () => {
+    filters.type = ''; filters.month = ''; filters.category = ''; filters.account = '';
+    $('filterType').value = ''; searchInput.value = '';
+    renderFilterSelects(); renderList();
+  });
+
+  txList.addEventListener('click', e => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    if (btn.dataset.action === 'edit') startEdit(btn.dataset.id);
+    if (btn.dataset.action === 'delete') deleteTx(btn.dataset.id);
+  });
+
+  accountList.addEventListener('click', e => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    if (btn.dataset.action === 'del-account') deleteAccount(btn.dataset.id);
+    if (btn.dataset.action === 'edit-account') editAccountInitial(btn.dataset.id);
+  });
+
+  addNoteBtn.addEventListener('click', submitNote);
+  cancelNoteEditBtn.addEventListener('click', endNoteEdit);
+  memoInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitNote(); } });
+  notesList.addEventListener('click', e => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    if (btn.dataset.action === 'toggle-note') toggleNote(btn.dataset.id);
+    if (btn.dataset.action === 'edit-note') startNoteEdit(btn.dataset.id);
+    if (btn.dataset.action === 'del-note') deleteNote(btn.dataset.id);
+  });
+
+  loanTypeSeg.addEventListener('click', e => {
+    const b = e.target.closest('[data-ltype]');
+    if (!b) return;
+    loanType = b.dataset.ltype;
+    renderLoanTypeSeg();
+  });
+  $('loanForm').addEventListener('submit', submitLoan);
+  loanCancelEditBtn.addEventListener('click', endLoanEdit);
+  loanList.addEventListener('click', e => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    if (btn.dataset.action === 'toggle-loan') toggleLoan(btn.dataset.id);
+    if (btn.dataset.action === 'edit-loan') startLoanEdit(btn.dataset.id);
+    if (btn.dataset.action === 'del-loan') deleteLoan(btn.dataset.id);
+  });
+
+  $('statsSubnav').addEventListener('click', e => {
+    const b = e.target.closest('[data-stat]');
+    if (b) { statsSub = b.dataset.stat; renderStatsNav(); }
+  });
+
+  statsMonth.addEventListener('change', () => { statsMonthValue = statsMonth.value; renderMonthStats(); });
+  dayMonth.addEventListener('change', () => { dayMonthValue = dayMonth.value; renderDayStats(); });
+  yearSelect.addEventListener('change', () => { yearValue = yearSelect.value; renderYearStats(); });
+
+  $('budgetSaveBtn').addEventListener('click', saveBudget);
+  $('addAccountBtn').addEventListener('click', addAccount);
+  $('mergeAccountsBtn').addEventListener('click', mergeAccountsByIcon);
+  $('exportCsvBtn').addEventListener('click', exportCSV);
+  $('exportJsonBtn').addEventListener('click', exportJSON);
+  $('importJsonInput').addEventListener('change', e => {
+    const f = e.target.files && e.target.files[0];
+    if (f) importJSON(f);
+    e.target.value = '';
+  });
+  $('clearDataBtn').addEventListener('click', clearData);
+
+  $('modalCancel').addEventListener('click', closeModal);
+  $('modalOk').addEventListener('click', () => {
+    const v = parseFloat($('modalInput').value);
+    const n = isFinite(v) ? Math.round(v * 100) / 100 : 0;
+    if (modalCb) modalCb(n);
+    closeModal();
+  });
+
+  themeSeg.addEventListener('click', e => {
+    const btn = e.target.closest('[data-theme-opt]');
+    if (!btn) return;
+    state.theme = btn.dataset.themeOpt;
+    save(); applyTheme(); renderSettings();
+  });
+
+  document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => navigate(t.dataset.view));
+  });
+
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (state.theme === 'auto') applyTheme();
+  });
+}
+
+/* ======================= 启动 ======================= */
+function init() {
+  applyTheme();
+  resetForm();
+  endLoanEdit();
+  render();
+  bindEvents();
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+}
+
+init();
